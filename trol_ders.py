@@ -1,11 +1,28 @@
 import streamlit as st
 from openai import OpenAI
+from supabase import create_client, Client
 from PIL import Image
 import base64
 import io
-import json
-import os
-from datetime import datetime
+from datetime import datetime, date
+
+# ================== SUPABASE ==================
+SUPABASE_URL = st.secrets["SUPABASE_URL"]
+SUPABASE_KEY = st.secrets["SUPABASE_KEY"]  # publishable key
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+# Streamlit her rerun'da bu dosyayı baştan çalıştırır, yani supabase client'ı da
+# sıfırdan oluşur. Giriş yapmış kullanıcının oturumunu tekrar bu client'a bağlamamız lazım.
+if st.session_state.get("access_token"):
+    try:
+        supabase.auth.set_session(
+            st.session_state.access_token, st.session_state.refresh_token
+        )
+    except Exception:
+        st.session_state.user = None
+        st.session_state.access_token = None
+        st.session_state.refresh_token = None
 
 # ================== OPENAI ==================
 api_key = None
@@ -16,6 +33,9 @@ else:
 
 client = OpenAI(api_key=api_key)
 # ============================================
+
+DAILY_MESSAGE_LIMIT = 30  # ücretsiz kullanıcı için günlük mesaj hakkı - istediğin sayıya değiştir
+DEFAULT_TITLE = "Yeni Sohbet"
 
 # ================== BELGE OKUMA (PDF / Word) ==================
 def extract_pdf_text(file_obj):
@@ -36,34 +56,76 @@ def extract_docx_text(file_obj):
     return "\n".join(p.text for p in document.paragraphs)
 
 
-# ================== KALICI KAYIT (JSON dosyası) ==================
-CHATS_FILE = "temai_chats.json"
+# ================== VERİTABANI YARDIMCI FONKSİYONLARI ==================
+def db_list_chats(user_id):
+    res = supabase.table("chats").select("*").eq("user_id", user_id).order("created_at").execute()
+    return res.data
 
-def default_chat():
-    return {"messages": [], "document_name": None, "document_text": "", "last_response_id": None}
 
-def load_chats():
-    if os.path.exists(CHATS_FILE):
-        try:
-            with open(CHATS_FILE, "r", encoding="utf-8") as f:
-                data = json.load(f)
-                if data:
-                    return data
-        except Exception:
-            pass
-    return {"Sohbet 1": default_chat()}
+def db_create_chat(user_id, title=DEFAULT_TITLE):
+    res = supabase.table("chats").insert({"user_id": user_id, "title": title}).execute()
+    return res.data[0]
 
-def save_chats():
+
+def db_rename_chat(chat_id, new_title):
+    supabase.table("chats").update({"title": new_title}).eq("id", chat_id).execute()
+
+
+def db_delete_chat(chat_id):
+    supabase.table("messages").delete().eq("chat_id", chat_id).execute()
+    supabase.table("chats").delete().eq("id", chat_id).execute()
+
+
+def db_update_chat_fields(chat_id, fields: dict):
+    supabase.table("chats").update(fields).eq("id", chat_id).execute()
+
+
+def db_list_messages(chat_id):
+    res = supabase.table("messages").select("*").eq("chat_id", chat_id).order("created_at").execute()
+    return res.data
+
+
+def db_add_message(chat_id, role, kind, content, feedback=None):
+    supabase.table("messages").insert({
+        "chat_id": chat_id, "role": role, "kind": kind, "content": content, "feedback": feedback
+    }).execute()
+
+
+def db_update_message_feedback(message_id, feedback):
+    supabase.table("messages").update({"feedback": feedback}).eq("id", message_id).execute()
+
+
+def get_today_usage(user_id):
+    today = date.today().isoformat()
+    res = supabase.table("usage_log").select("*").eq("user_id", user_id).eq("usage_date", today).execute()
+    if res.data:
+        return res.data[0]
+    return None
+
+
+def increment_usage(user_id):
+    existing = get_today_usage(user_id)
+    if existing:
+        supabase.table("usage_log").update(
+            {"message_count": existing["message_count"] + 1}
+        ).eq("id", existing["id"]).execute()
+    else:
+        supabase.table("usage_log").insert(
+            {"user_id": user_id, "usage_date": date.today().isoformat(), "message_count": 1}
+        ).execute()
+
+
+def format_ts(iso_str):
     try:
-        with open(CHATS_FILE, "w", encoding="utf-8") as f:
-            json.dump(st.session_state.chats, f, ensure_ascii=False)
-    except Exception as e:
-        st.warning(f"Sohbetler kaydedilemedi: {e}")
+        dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
+        return dt.strftime("%H:%M")
+    except Exception:
+        return ""
 
 
 st.set_page_config(page_title="Temai", page_icon="🧠", layout="wide")
 
-# ----------------- CSS (genel görünüm cilası) -----------------
+# ----------------- CSS -----------------
 st.markdown("""
 <style>
 .stApp {
@@ -96,82 +158,130 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 
-# ----------------- SIDEBAR: SADECE SOHBET LİSTESİ -----------------
+# ================== GİRİŞ / KAYIT EKRANI ==================
+if "user" not in st.session_state:
+    st.session_state.user = None
+
+if not st.session_state.user:
+    st.title("🧠 Temai'ye Hoş Geldin")
+    tab_login, tab_signup = st.tabs(["Giriş Yap", "Kayıt Ol"])
+
+    with tab_login:
+        login_email = st.text_input("E-posta", key="login_email")
+        login_pw = st.text_input("Şifre", type="password", key="login_pw")
+        if st.button("Giriş Yap", use_container_width=True):
+            try:
+                res = supabase.auth.sign_in_with_password(
+                    {"email": login_email, "password": login_pw}
+                )
+                st.session_state.user = res.user
+                st.session_state.access_token = res.session.access_token
+                st.session_state.refresh_token = res.session.refresh_token
+                st.rerun()
+            except Exception as e:
+                st.error(f"Giriş başarısız: {e}")
+
+    with tab_signup:
+        signup_email = st.text_input("E-posta", key="signup_email")
+        signup_pw = st.text_input("Şifre (en az 6 karakter)", type="password", key="signup_pw")
+        if st.button("Kayıt Ol", use_container_width=True):
+            try:
+                supabase.auth.sign_up({"email": signup_email, "password": signup_pw})
+                st.success(
+                    "Kayıt başarılı! E-postana gelen onay linkine tıkla, "
+                    "sonra 'Giriş Yap' sekmesinden giriş yap."
+                )
+            except Exception as e:
+                st.error(f"Kayıt başarısız: {e}")
+
+    st.stop()  # Giriş yapılmadan uygulamanın geri kalanı hiç çalışmasın.
+
+user = st.session_state.user
+user_id = user.id
+
+# ----------------- SIDEBAR: KULLANICI + SOHBET LİSTESİ -----------------
 st.sidebar.title("💬 Sohbetler")
+st.sidebar.caption(f"👤 {user.email}")
 
-if "chats" not in st.session_state:
-    st.session_state.chats = load_chats()
-    st.session_state.active_chat = list(st.session_state.chats.keys())[0]
-
-if st.sidebar.button("➕ Yeni Sohbet Ekle", use_container_width=True):
-    n = len(st.session_state.chats) + 1
-    name = f"Sohbet {n}"
-    while name in st.session_state.chats:  # aynı isimde bir sohbet zaten varsa üzerine yazma
-        n += 1
-        name = f"Sohbet {n}"
-    st.session_state.chats[name] = default_chat()
-    st.session_state.active_chat = name
-    save_chats()
+if st.sidebar.button("🚪 Çıkış Yap", use_container_width=True):
+    try:
+        supabase.auth.sign_out()
+    except Exception:
+        pass
+    for k in ["user", "access_token", "refresh_token", "active_chat_id", "renaming_chat_id"]:
+        st.session_state.pop(k, None)
     st.rerun()
 
 st.sidebar.markdown("---")
 
-if "renaming_chat" not in st.session_state:
-    st.session_state.renaming_chat = None
+chats = db_list_chats(user_id)
 
-for chat in list(st.session_state.chats.keys()):
-    if st.session_state.renaming_chat == chat:
+if st.sidebar.button("➕ Yeni Sohbet Ekle", use_container_width=True):
+    new_chat = db_create_chat(user_id)
+    st.session_state.active_chat_id = new_chat["id"]
+    st.rerun()
+
+# Aktif sohbet geçerli değilse (silinmiş, ilk açılış vs.) uygun bir tane seç/oluştur.
+if "active_chat_id" not in st.session_state or not any(c["id"] == st.session_state.active_chat_id for c in chats):
+    if chats:
+        st.session_state.active_chat_id = chats[0]["id"]
+    else:
+        new_chat = db_create_chat(user_id)
+        chats = [new_chat]
+        st.session_state.active_chat_id = new_chat["id"]
+
+if "renaming_chat_id" not in st.session_state:
+    st.session_state.renaming_chat_id = None
+
+for c in chats:
+    cid = c["id"]
+    if st.session_state.renaming_chat_id == cid:
         new_name = st.sidebar.text_input(
-            "Yeni isim", value=chat, key=f"rename_input_{chat}", label_visibility="collapsed"
+            "Yeni isim", value=c["title"], key=f"rename_input_{cid}", label_visibility="collapsed"
         )
         col_ok, col_cancel = st.sidebar.columns(2)
         with col_ok:
-            if st.button("✅ Kaydet", key=f"rename_save_{chat}", use_container_width=True):
+            if st.button("✅ Kaydet", key=f"rename_save_{cid}", use_container_width=True):
                 new_name = new_name.strip()
-                if new_name and (new_name == chat or new_name not in st.session_state.chats):
-                    reordered = {}
-                    for k, v in st.session_state.chats.items():
-                        reordered[new_name if k == chat else k] = v
-                    st.session_state.chats = reordered
-                    if st.session_state.active_chat == chat:
-                        st.session_state.active_chat = new_name
-                else:
-                    st.sidebar.warning("Bu isim boş olamaz veya zaten kullanılıyor.")
-                st.session_state.renaming_chat = None
-                save_chats()
+                if new_name:
+                    db_rename_chat(cid, new_name)
+                st.session_state.renaming_chat_id = None
                 st.rerun()
         with col_cancel:
-            if st.button("✖ Vazgeç", key=f"rename_cancel_{chat}", use_container_width=True):
-                st.session_state.renaming_chat = None
+            if st.button("✖ Vazgeç", key=f"rename_cancel_{cid}", use_container_width=True):
+                st.session_state.renaming_chat_id = None
                 st.rerun()
     else:
         col_a, col_b, col_c = st.sidebar.columns([3, 1, 1])
         with col_a:
-            label = f"🟢 {chat}" if chat == st.session_state.active_chat else chat
-            if st.button(label, key=f"select_{chat}", use_container_width=True):
-                st.session_state.active_chat = chat
+            label = f"🟢 {c['title']}" if cid == st.session_state.active_chat_id else c["title"]
+            if st.button(label, key=f"select_{cid}", use_container_width=True):
+                st.session_state.active_chat_id = cid
                 st.rerun()
         with col_b:
-            if st.button("✏️", key=f"ren_{chat}"):
-                st.session_state.renaming_chat = chat
+            if st.button("✏️", key=f"ren_{cid}"):
+                st.session_state.renaming_chat_id = cid
                 st.rerun()
         with col_c:
-            if len(st.session_state.chats) > 1 and st.button("🗑️", key=f"del_{chat}"):
-                del st.session_state.chats[chat]
-                if st.session_state.active_chat == chat:
-                    st.session_state.active_chat = list(st.session_state.chats.keys())[0]
-                save_chats()
+            if len(chats) > 1 and st.button("🗑️", key=f"del_{cid}"):
+                db_delete_chat(cid)
+                if st.session_state.active_chat_id == cid:
+                    st.session_state.pop("active_chat_id", None)
                 st.rerun()
 
 # ----------------- MAIN -----------------
 st.title("🧠 Temai")
 
-active_data = st.session_state.chats[st.session_state.active_chat]
+active_chat = next(c for c in chats if c["id"] == st.session_state.active_chat_id)
+active_chat_id = active_chat["id"]
 
-# ----------------- ARAÇ ÇUBUĞU (mod, token, belge) -----------------
+today_usage = get_today_usage(user_id)
+used_today = today_usage["message_count"] if today_usage else 0
+
+# ----------------- ARAÇ ÇUBUĞU (mod, token, belge, kullanım) -----------------
 with st.container():
     st.markdown('<div class="temai-toolbar">', unsafe_allow_html=True)
-    tool_col1, tool_col2, tool_col3 = st.columns([2, 1.4, 2])
+    tool_col1, tool_col2, tool_col3, tool_col4 = st.columns([2, 1.3, 2, 1.4])
 
     with tool_col1:
         mode = st.radio(
@@ -193,30 +303,36 @@ with st.container():
             )
 
     with tool_col3:
-        if active_data.get("document_name"):
+        if active_chat.get("document_name"):
             doc_col1, doc_col2 = st.columns([3, 1])
             with doc_col1:
-                st.markdown(f"📄 **{active_data['document_name']}**")
+                st.markdown(f"📄 **{active_chat['document_name']}**")
             with doc_col2:
                 if st.button("🗑️", key="remove_doc"):
-                    active_data["document_name"] = None
-                    active_data["document_text"] = ""
-                    save_chats()
+                    db_update_chat_fields(active_chat_id, {"document_name": None, "document_text": ""})
                     st.rerun()
         else:
             st.caption("📄 Belge eklenmedi")
 
+    with tool_col4:
+        st.caption(f"📊 Bugün: {used_today}/{DAILY_MESSAGE_LIMIT}")
+
     st.markdown('</div>', unsafe_allow_html=True)
 
-# ----------------- SOHBET GEÇMİŞİ -----------------
-messages = active_data["messages"]
+limit_reached = used_today >= DAILY_MESSAGE_LIMIT
+if limit_reached:
+    st.warning(f"Bugünlük {DAILY_MESSAGE_LIMIT} mesaj hakkını doldurdun. Yarın tekrar deneyebilirsin.")
 
-for idx, msg in enumerate(messages):
-    role = msg[0]
-    kind = msg[1]
-    content = msg[2]
-    ts = msg[3] if len(msg) > 3 else ""
-    feedback = msg[4] if len(msg) > 4 else None
+# ----------------- SOHBET GEÇMİŞİ -----------------
+messages = db_list_messages(active_chat_id)
+had_messages_before = len(messages) > 0
+
+for m in messages:
+    role = m["role"]
+    kind = m["kind"]
+    content = m["content"]
+    ts = format_ts(m.get("created_at", ""))
+    feedback = m.get("feedback")
 
     display_role = "user" if role == "user" else "assistant"
     avatar = "🙂" if role == "user" else "🧠"
@@ -229,7 +345,6 @@ for idx, msg in enumerate(messages):
         if ts:
             st.markdown(f'<div class="temai-timestamp">{ts}</div>', unsafe_allow_html=True)
 
-        # Sadece bot'un yazı cevaplarına geri bildirim butonu koyuyoruz.
         if role == "bot" and kind == "text":
             if feedback:
                 icon = "👍" if feedback == "up" else "👎"
@@ -237,21 +352,15 @@ for idx, msg in enumerate(messages):
             else:
                 fb_col1, fb_col2, _ = st.columns([1, 1, 10])
                 with fb_col1:
-                    if st.button("👍", key=f"fbup_{st.session_state.active_chat}_{idx}"):
-                        while len(messages[idx]) < 5:
-                            messages[idx].append(None)
-                        messages[idx][4] = "up"
-                        save_chats()
+                    if st.button("👍", key=f"fbup_{m['id']}"):
+                        db_update_message_feedback(m["id"], "up")
                         st.rerun()
                 with fb_col2:
-                    if st.button("👎", key=f"fbdown_{st.session_state.active_chat}_{idx}"):
-                        while len(messages[idx]) < 5:
-                            messages[idx].append(None)
-                        messages[idx][4] = "down"
-                        save_chats()
+                    if st.button("👎", key=f"fbdown_{m['id']}"):
+                        db_update_message_feedback(m["id"], "down")
                         st.rerun()
 
-# ----------------- KAMERA (ayrı, çünkü canlı çekim chat kutusunun içine gömülemiyor) -----------------
+# ----------------- KAMERA -----------------
 if "upload_key" not in st.session_state:
     st.session_state.upload_key = 0
 if "camera_open" not in st.session_state:
@@ -275,15 +384,15 @@ with cam_col:
         )
 
 # ----------------- MESAJ KUTUSU + GÖMÜLÜ '+' DOSYA BUTONU -----------------
-# accept_file=True, chat_input'un içine bu sohbetteki gibi bir ataç/artı ikonu ekler.
-# (Bu özellik Streamlit'in yeni sürümlerinde var; eski sürümde hata verirse haber ver.)
 user_message = st.chat_input(
-    "sohbete başlamak için bir şey yazın...",
+    "sohbete başlamak için bir şey yazın..." if not limit_reached else "Günlük limit doldu",
     accept_file=True,
     file_type=["png", "jpg", "jpeg", "pdf", "docx"],
+    disabled=limit_reached,
 )
 
-def system_prompt(mode):
+
+def system_prompt(mode, doc_text):
     if mode == "😁 Troll":
         base = "Sen Temai adlı TROLL bir asistansın. Mantıklı görünen ama yanlış cevaplar ver."
     elif mode == "📖 Akademik":
@@ -291,7 +400,6 @@ def system_prompt(mode):
     else:
         base = "Sen Temai adlı chatgpt ve openai ile hicbir alakası olmayan yardımcı bir asistansın."
 
-    doc_text = active_data.get("document_text", "")
     if doc_text:
         base += (
             "\n\nKullanıcı aşağıdaki belgeyi yükledi. Sorularını mümkün olduğunca "
@@ -301,42 +409,13 @@ def system_prompt(mode):
     return base
 
 
-def auto_title_chat(chat_key, first_user_message):
-    """İlk mesaja bakıp sohbete kısa, akıllı bir başlık verir (hâlâ varsayılan isimdeyse)."""
-    if not chat_key.startswith("Sohbet "):
-        return  # Kullanıcı zaten kendi ismini vermiş, dokunma.
-    try:
-        title_response = client.responses.create(
-            model="gpt-4.1-mini",
-            input=[{"role": "user", "content": [{"type": "input_text", "text": first_user_message}]}],
-            instructions=(
-                "Kullanıcının ilk mesajına bakarak bu sohbet için 2-4 kelimelik, "
-                "kısa ve açıklayıcı bir Türkçe başlık üret. Sadece başlığı yaz, "
-                "tırnak işareti, noktalama veya başka hiçbir şey ekleme."
-            ),
-            max_output_tokens=20,
-        )
-        new_title = title_response.output_text.strip().strip('"').strip("'")
-        if new_title and new_title not in st.session_state.chats:
-            reordered = {}
-            for k, v in st.session_state.chats.items():
-                reordered[new_title if k == chat_key else k] = v
-            st.session_state.chats = reordered
-            if st.session_state.active_chat == chat_key:
-                st.session_state.active_chat = new_title
-    except Exception:
-        pass  # Başlık üretilemezse sorun değil, varsayılan isim kalır.
-
-
 def extract_generated_image(final_response):
-    """Responses API'nin image_generation aracı ile ürettiği görseli (varsa) base64 olarak döndürür."""
     try:
         for item in getattr(final_response, "output", []) or []:
-            item_type = getattr(item, "type", None)
-            if item_type == "image_generation_call":
+            if getattr(item, "type", None) == "image_generation_call":
                 result = getattr(item, "result", None)
                 if result:
-                    return result  # zaten base64 string
+                    return result
     except Exception:
         pass
     return None
@@ -346,7 +425,6 @@ def ask_temai(user_content, instructions, previous_response_id, max_tokens, plac
     full_text = ""
     new_response_id = None
     generated_image_b64 = None
-    # image_generation: model, kullanıcı görsel isterse kendisi resim üretebilsin diye.
     tools = [{"type": "image_generation"}]
     try:
         with client.responses.stream(
@@ -379,7 +457,6 @@ def ask_temai(user_content, instructions, previous_response_id, max_tokens, plac
         new_response_id = response.id
         generated_image_b64 = extract_generated_image(response)
     except TypeError:
-        # tools/image_generation bu kütüphane sürümünde desteklenmiyor olabilir; onsuz dene.
         response = client.responses.create(
             model="gpt-4.1-mini",
             input=[{"role": "user", "content": user_content}],
@@ -394,8 +471,28 @@ def ask_temai(user_content, instructions, previous_response_id, max_tokens, plac
     return full_text, new_response_id, generated_image_b64
 
 
-# chat_input hem yazı hem dosya taşıyabilir; kamera fotoğrafı ayrı bir widget'tan geliyor.
-if user_message or camera_file is not None:
+def auto_title_chat(chat_id, current_title, first_user_message):
+    if current_title != DEFAULT_TITLE:
+        return
+    try:
+        title_response = client.responses.create(
+            model="gpt-4.1-mini",
+            input=[{"role": "user", "content": [{"type": "input_text", "text": first_user_message}]}],
+            instructions=(
+                "Kullanıcının ilk mesajına bakarak bu sohbet için 2-4 kelimelik, "
+                "kısa ve açıklayıcı bir Türkçe başlık üret. Sadece başlığı yaz, "
+                "tırnak işareti, noktalama veya başka hiçbir şey ekleme."
+            ),
+            max_output_tokens=20,
+        )
+        new_title = title_response.output_text.strip().strip('"').strip("'")
+        if new_title:
+            db_rename_chat(chat_id, new_title)
+    except Exception:
+        pass
+
+
+if (user_message or camera_file is not None) and not limit_reached:
     user_text = (user_message.text.strip() if user_message else "") or ""
     attached_from_input = user_message.files[0] if (user_message and user_message.files) else None
     attached_file = camera_file if camera_file is not None else attached_from_input
@@ -421,8 +518,10 @@ if user_message or camera_file is not None:
                     extracted_text = extract_docx_text(attached_file)
 
                 if extracted_text.strip():
-                    active_data["document_name"] = attached_file.name
-                    active_data["document_text"] = extracted_text
+                    db_update_chat_fields(active_chat_id, {
+                        "document_name": attached_file.name,
+                        "document_text": extracted_text,
+                    })
                     doc_just_uploaded = attached_file.name
                 else:
                     st.warning("Belgeden metin çıkarılamadı (taranmış/görsel bir PDF olabilir).")
@@ -432,7 +531,6 @@ if user_message or camera_file is not None:
                     "Gerekli kütüphaneler yüklü mü kontrol et: pip install pypdf python-docx"
                 )
 
-    # Kullanıcı sadece dosya gönderip yazı yazmadıysa, mantıklı bir varsayılan mesaj kullan.
     if not user_text:
         if image_base64:
             user_text = "Bu resmi incele ve açıkla."
@@ -440,16 +538,13 @@ if user_message or camera_file is not None:
             user_text = f"'{doc_just_uploaded}' belgesini yükledim, içeriğini özetler misin?"
 
     if user_text:
-        now_str = datetime.now().strftime("%H:%M")
-
         if image_base64:
-            messages.append(["user", "image", image_base64, now_str])
+            db_add_message(active_chat_id, "user", "image", image_base64)
             with st.chat_message("user", avatar="🙂"):
                 st.image(io.BytesIO(base64.b64decode(image_base64)))
-        messages.append(["user", "text", user_text, now_str])
+        db_add_message(active_chat_id, "user", "text", user_text)
         with st.chat_message("user", avatar="🙂"):
             st.markdown(user_text)
-        save_chats()
 
         with st.chat_message("assistant", avatar="🧠"):
             placeholder = st.empty()
@@ -465,15 +560,18 @@ if user_message or camera_file is not None:
                         "image_url": f"data:{image_mime};base64,{image_base64}"
                     })
 
+                # En güncel belge metnini veritabanından tazele (az önce yüklenmiş olabilir).
+                fresh_chat = supabase.table("chats").select("*").eq("id", active_chat_id).execute().data[0]
+
                 reply, resp_id, generated_image_b64 = ask_temai(
                     user_content=content,
-                    instructions=system_prompt(mode),
-                    previous_response_id=active_data.get("last_response_id"),
+                    instructions=system_prompt(mode, fresh_chat.get("document_text", "")),
+                    previous_response_id=fresh_chat.get("last_response_id"),
                     max_tokens=max_tokens,
                     placeholder=placeholder,
                 )
                 if resp_id:
-                    active_data["last_response_id"] = resp_id
+                    db_update_chat_fields(active_chat_id, {"last_response_id": resp_id})
 
             except Exception as e:
                 reply = f"❌ Hata: {e}"
@@ -482,17 +580,15 @@ if user_message or camera_file is not None:
             if generated_image_b64:
                 st.image(io.BytesIO(base64.b64decode(generated_image_b64)))
 
-        reply_ts = datetime.now().strftime("%H:%M")
         if reply:
-            messages.append(["bot", "text", reply, reply_ts])
+            db_add_message(active_chat_id, "bot", "text", reply)
         if generated_image_b64:
-            messages.append(["bot", "image", generated_image_b64, reply_ts])
-        save_chats()
+            db_add_message(active_chat_id, "bot", "image", generated_image_b64)
 
-        # İlk kullanıcı-bot alışverişinden sonra, hâlâ varsayılan isimdeyse başlığı otomatik koy.
-        if st.session_state.active_chat.startswith("Sohbet ") and len(messages) <= 3:
-            auto_title_chat(st.session_state.active_chat, user_text)
-            save_chats()
+        increment_usage(user_id)
+
+        if not had_messages_before:
+            auto_title_chat(active_chat_id, active_chat["title"], user_text)
 
         st.session_state.upload_key += 1
         st.session_state.camera_open = False
