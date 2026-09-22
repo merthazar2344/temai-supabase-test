@@ -4,3 +4,4 @@ python-dotenv
 pillow
 pypdf
 python-docx
+supabase
