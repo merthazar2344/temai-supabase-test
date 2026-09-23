@@ -12,18 +12,6 @@ SUPABASE_KEY = st.secrets["SUPABASE_KEY"]  # publishable key
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-# Streamlit her rerun'da bu dosyayı baştan çalıştırır, yani supabase client'ı da
-# sıfırdan oluşur. Giriş yapmış kullanıcının oturumunu tekrar bu client'a bağlamamız lazım.
-if st.session_state.get("access_token"):
-    try:
-        supabase.auth.set_session(
-            st.session_state.access_token, st.session_state.refresh_token
-        )
-    except Exception:
-        st.session_state.user = None
-        st.session_state.access_token = None
-        st.session_state.refresh_token = None
-
 # ================== OPENAI ==================
 api_key = None
 if "OPENAI_API_KEY" in st.secrets:
@@ -137,6 +125,57 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 
+# ================== "BENİ AÇIK TUT" - TARAYICI COOKIE'Sİ ==================
+# Streamlit her sayfa yenilemesinde session_state'i sıfırlayabilir; kalıcı giriş
+# için refresh_token'ı tarayıcı cookie'sinde saklıyoruz.
+from streamlit_cookies_manager import EncryptedCookieManager
+
+cookies = EncryptedCookieManager(
+    prefix="temai/",
+    password=st.secrets.get("COOKIES_PASSWORD", "temai-varsayilan-anahtar-bunu-degistir"),
+)
+if not cookies.ready():
+    st.stop()
+
+# 1) Bu oturumda (session_state) zaten giriş bilgisi varsa, supabase client'a bağla.
+if st.session_state.get("access_token"):
+    try:
+        supabase.auth.set_session(
+            st.session_state.access_token, st.session_state.refresh_token
+        )
+    except Exception:
+        st.session_state.user = None
+        st.session_state.access_token = None
+        st.session_state.refresh_token = None
+
+# 2) session_state boşsa (sayfa yenilendi/tarayıcı kapatılıp açıldı), "beni açık tut"
+#    ile bırakılmış cookie var mı diye bak, varsa oturumu ondan geri yükle.
+elif cookies.get("refresh_token"):
+    try:
+        res = supabase.auth.refresh_session(cookies.get("refresh_token"))
+        st.session_state.user = res.user
+        st.session_state.access_token = res.session.access_token
+        st.session_state.refresh_token = res.session.refresh_token
+        cookies["refresh_token"] = res.session.refresh_token  # Supabase yeni bir refresh_token verebilir
+        cookies.save()
+    except Exception:
+        pass
+
+
+def save_login_cookie(refresh_token):
+    cookies["refresh_token"] = refresh_token
+    cookies.save()
+
+
+def clear_login_cookie():
+    try:
+        if "refresh_token" in cookies:
+            del cookies["refresh_token"]
+            cookies.save()
+    except Exception:
+        pass
+
+
 def password_is_strong(pw):
     """En az 6 karakter, en az bir harf ve en az bir rakam içermeli."""
     if len(pw) < 6:
@@ -159,6 +198,7 @@ if not st.session_state.user:
     with tab_login:
         login_email = st.text_input("E-posta", key="login_email")
         login_pw = st.text_input("Şifre", type="password", key="login_pw")
+        keep_logged_in_login = st.checkbox("🔒 Beni açık tut", value=True, key="keep_login")
         if st.button("Giriş Yap", use_container_width=True):
             try:
                 res = supabase.auth.sign_in_with_password(
@@ -167,6 +207,8 @@ if not st.session_state.user:
                 st.session_state.user = res.user
                 st.session_state.access_token = res.session.access_token
                 st.session_state.refresh_token = res.session.refresh_token
+                if keep_logged_in_login:
+                    save_login_cookie(res.session.refresh_token)
                 st.rerun()
             except Exception as e:
                 st.error(f"Giriş başarısız: {e}")
@@ -196,6 +238,7 @@ if not st.session_state.user:
                         st.session_state.user = res.user
                         st.session_state.access_token = res.session.access_token
                         st.session_state.refresh_token = res.session.refresh_token
+                        save_login_cookie(res.session.refresh_token)
                         st.rerun()
                     else:
                         st.success(
@@ -294,6 +337,7 @@ with st.sidebar.expander("⚙️ Profil / Hesap Ayarları"):
                     db_delete_chat(c["id"])
                 supabase.table("profiles").delete().eq("id", user_id).execute()
                 supabase.auth.sign_out()
+                clear_login_cookie()
                 for k in ["user", "access_token", "refresh_token", "active_chat_id", "renaming_chat_id"]:
                     st.session_state.pop(k, None)
                 st.rerun()
@@ -305,6 +349,7 @@ if st.sidebar.button("🚪 Çıkış Yap", use_container_width=True):
         supabase.auth.sign_out()
     except Exception:
         pass
+    clear_login_cookie()
     for k in ["user", "access_token", "refresh_token", "active_chat_id", "renaming_chat_id"]:
         st.session_state.pop(k, None)
     st.rerun()
