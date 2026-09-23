@@ -5,4 +5,4 @@ pillow
 pypdf
 python-docx
 supabase
-streamlit-cookies-manager
+streamlit-cookies-manager-v2
