@@ -4,7 +4,7 @@ from supabase import create_client, Client
 from PIL import Image
 import base64
 import io
-from datetime import datetime, date
+from datetime import datetime
 
 # ================== SUPABASE ==================
 SUPABASE_URL = st.secrets["SUPABASE_URL"]
@@ -34,7 +34,6 @@ else:
 client = OpenAI(api_key=api_key)
 # ============================================
 
-DAILY_MESSAGE_LIMIT = 30  # ücretsiz kullanıcı için günlük mesaj hakkı - istediğin sayıya değiştir
 DEFAULT_TITLE = "Yeni Sohbet"
 
 # ================== BELGE OKUMA (PDF / Word) ==================
@@ -95,26 +94,6 @@ def db_update_message_feedback(message_id, feedback):
     supabase.table("messages").update({"feedback": feedback}).eq("id", message_id).execute()
 
 
-def get_today_usage(user_id):
-    today = date.today().isoformat()
-    res = supabase.table("usage_log").select("*").eq("user_id", user_id).eq("usage_date", today).execute()
-    if res.data:
-        return res.data[0]
-    return None
-
-
-def increment_usage(user_id):
-    existing = get_today_usage(user_id)
-    if existing:
-        supabase.table("usage_log").update(
-            {"message_count": existing["message_count"] + 1}
-        ).eq("id", existing["id"]).execute()
-    else:
-        supabase.table("usage_log").insert(
-            {"user_id": user_id, "usage_date": date.today().isoformat(), "message_count": 1}
-        ).execute()
-
-
 def format_ts(iso_str):
     try:
         dt = datetime.fromisoformat(iso_str.replace("Z", "+00:00"))
@@ -158,6 +137,17 @@ h1 {
 </style>
 """, unsafe_allow_html=True)
 
+def password_is_strong(pw):
+    """En az 6 karakter, en az bir harf ve en az bir rakam içermeli."""
+    if len(pw) < 6:
+        return False, "Şifre en az 6 karakter olmalı."
+    if not any(ch.isdigit() for ch in pw):
+        return False, "Şifre en az bir rakam içermeli."
+    if not any(ch.isalpha() for ch in pw):
+        return False, "Şifre en az bir harf içermeli."
+    return True, ""
+
+
 # ================== GİRİŞ / KAYIT EKRANI ==================
 if "user" not in st.session_state:
     st.session_state.user = None
@@ -183,25 +173,132 @@ if not st.session_state.user:
 
     with tab_signup:
         signup_email = st.text_input("E-posta", key="signup_email")
-        signup_pw = st.text_input("Şifre (en az 6 karakter)", type="password", key="signup_pw")
+        signup_pw = st.text_input(
+            "Şifre (en az 6 karakter, en az 1 harf ve 1 rakam)",
+            type="password", key="signup_pw"
+        )
+        signup_pw2 = st.text_input("Şifreyi Tekrar Gir", type="password", key="signup_pw2")
+
         if st.button("Kayıt Ol", use_container_width=True):
-            try:
-                supabase.auth.sign_up({"email": signup_email, "password": signup_pw})
-                st.success(
-                    "Kayıt başarılı! E-postana gelen onay linkine tıkla, "
-                    "sonra 'Giriş Yap' sekmesinden giriş yap."
-                )
-            except Exception as e:
-                st.error(f"Kayıt başarısız: {e}")
+            is_strong, strength_msg = password_is_strong(signup_pw)
+            if not signup_email.strip():
+                st.error("Lütfen bir e-posta adresi gir.")
+            elif signup_pw != signup_pw2:
+                st.error("Girdiğin iki şifre birbiriyle uyuşmuyor.")
+            elif not is_strong:
+                st.error(strength_msg)
+            else:
+                try:
+                    res = supabase.auth.sign_up({"email": signup_email, "password": signup_pw})
+                    if res.session:
+                        # E-posta onayı kapalıysa Supabase burada direkt oturum döndürür,
+                        # kullanıcı mail beklemeden içeri girer.
+                        st.session_state.user = res.user
+                        st.session_state.access_token = res.session.access_token
+                        st.session_state.refresh_token = res.session.refresh_token
+                        st.rerun()
+                    else:
+                        st.success(
+                            "Kayıt başarılı! E-postana gelen onay linkine tıkla, "
+                            "sonra 'Giriş Yap' sekmesinden giriş yap."
+                        )
+                except Exception as e:
+                    st.error(f"Kayıt başarısız: {e}")
 
     st.stop()  # Giriş yapılmadan uygulamanın geri kalanı hiç çalışmasın.
 
 user = st.session_state.user
 user_id = user.id
 
+
+def db_get_profile(user_id):
+    res = supabase.table("profiles").select("*").eq("id", user_id).execute()
+    return res.data[0] if res.data else {"id": user_id, "email": user.email, "display_name": None}
+
+
+def db_update_profile(user_id, fields: dict):
+    supabase.table("profiles").update(fields).eq("id", user_id).execute()
+
+
+profile = db_get_profile(user_id)
+display_name = profile.get("display_name") or user.email.split("@")[0]
+
 # ----------------- SIDEBAR: KULLANICI + SOHBET LİSTESİ -----------------
 st.sidebar.title("💬 Sohbetler")
-st.sidebar.caption(f"👤 {user.email}")
+st.sidebar.caption(f"👤 {display_name}")
+
+with st.sidebar.expander("⚙️ Profil / Hesap Ayarları"):
+    st.caption(f"E-posta: {user.email}")
+
+    # --- İsim değiştir ---
+    new_display_name = st.text_input("Görünen isim", value=display_name, key="profile_name")
+    if st.button("İsmi Kaydet", key="save_name", use_container_width=True):
+        db_update_profile(user_id, {"display_name": new_display_name.strip()})
+        st.success("İsim güncellendi.")
+        st.rerun()
+
+    st.markdown("---")
+
+    # --- E-posta değiştir ---
+    new_email = st.text_input("Yeni e-posta", key="profile_email")
+    if st.button("E-postayı Değiştir", key="save_email", use_container_width=True):
+        if not new_email.strip():
+            st.error("Lütfen bir e-posta adresi gir.")
+        else:
+            try:
+                supabase.auth.update_user({"email": new_email.strip()})
+                st.success(
+                    "İstek gönderildi. Supabase ayarına göre, yeni adresine gelen "
+                    "onay linkine tıklaman gerekebilir."
+                )
+            except Exception as e:
+                st.error(f"E-posta değiştirilemedi: {e}")
+
+    st.markdown("---")
+
+    # --- Şifre değiştir ---
+    new_pw = st.text_input(
+        "Yeni şifre (en az 6 karakter, 1 harf + 1 rakam)",
+        type="password", key="profile_pw"
+    )
+    new_pw2 = st.text_input("Yeni şifreyi tekrar gir", type="password", key="profile_pw2")
+    if st.button("Şifreyi Değiştir", key="save_pw", use_container_width=True):
+        is_strong, strength_msg = password_is_strong(new_pw)
+        if new_pw != new_pw2:
+            st.error("Girdiğin iki şifre birbiriyle uyuşmuyor.")
+        elif not is_strong:
+            st.error(strength_msg)
+        else:
+            try:
+                supabase.auth.update_user({"password": new_pw})
+                st.success("Şifren güncellendi.")
+            except Exception as e:
+                st.error(f"Şifre değiştirilemedi: {e}")
+
+    st.markdown("---")
+
+    # --- Hesap verilerini sil ---
+    st.caption(
+        "⚠️ Bu işlem tüm sohbetlerini ve mesajlarını kalıcı olarak siler. "
+        "(Not: Bu, sadece Temai'deki verilerini siler; giriş hesabının tamamen "
+        "kaldırılması için ek bir adım gerekir, bunu sonra ekleyebiliriz.)"
+    )
+    confirm_delete = st.checkbox("Verilerimi silmek istediğimi onaylıyorum", key="confirm_delete")
+    if st.button("🗑️ Hesap Verilerimi Sil", key="delete_account", use_container_width=True):
+        if not confirm_delete:
+            st.error("Önce yukarıdaki onay kutusunu işaretle.")
+        else:
+            try:
+                my_chats = db_list_chats(user_id)
+                for c in my_chats:
+                    db_delete_chat(c["id"])
+                supabase.table("profiles").delete().eq("id", user_id).execute()
+                supabase.auth.sign_out()
+                for k in ["user", "access_token", "refresh_token", "active_chat_id", "renaming_chat_id"]:
+                    st.session_state.pop(k, None)
+                st.rerun()
+            except Exception as e:
+                st.error(f"Silme işlemi sırasında hata oluştu: {e}")
 
 if st.sidebar.button("🚪 Çıkış Yap", use_container_width=True):
     try:
@@ -275,13 +372,10 @@ st.title("🧠 Temai")
 active_chat = next(c for c in chats if c["id"] == st.session_state.active_chat_id)
 active_chat_id = active_chat["id"]
 
-today_usage = get_today_usage(user_id)
-used_today = today_usage["message_count"] if today_usage else 0
-
-# ----------------- ARAÇ ÇUBUĞU (mod, token, belge, kullanım) -----------------
+# ----------------- ARAÇ ÇUBUĞU (mod, token, belge) -----------------
 with st.container():
     st.markdown('<div class="temai-toolbar">', unsafe_allow_html=True)
-    tool_col1, tool_col2, tool_col3, tool_col4 = st.columns([2, 1.3, 2, 1.4])
+    tool_col1, tool_col2, tool_col3 = st.columns([2, 1.4, 2])
 
     with tool_col1:
         mode = st.radio(
@@ -314,14 +408,7 @@ with st.container():
         else:
             st.caption("📄 Belge eklenmedi")
 
-    with tool_col4:
-        st.caption(f"📊 Bugün: {used_today}/{DAILY_MESSAGE_LIMIT}")
-
     st.markdown('</div>', unsafe_allow_html=True)
-
-limit_reached = used_today >= DAILY_MESSAGE_LIMIT
-if limit_reached:
-    st.warning(f"Bugünlük {DAILY_MESSAGE_LIMIT} mesaj hakkını doldurdun. Yarın tekrar deneyebilirsin.")
 
 # ----------------- SOHBET GEÇMİŞİ -----------------
 messages = db_list_messages(active_chat_id)
@@ -385,10 +472,9 @@ with cam_col:
 
 # ----------------- MESAJ KUTUSU + GÖMÜLÜ '+' DOSYA BUTONU -----------------
 user_message = st.chat_input(
-    "sohbete başlamak için bir şey yazın..." if not limit_reached else "Günlük limit doldu",
+    "sohbete başlamak için bir şey yazın...",
     accept_file=True,
     file_type=["png", "jpg", "jpeg", "pdf", "docx"],
-    disabled=limit_reached,
 )
 
 
@@ -492,7 +578,7 @@ def auto_title_chat(chat_id, current_title, first_user_message):
         pass
 
 
-if (user_message or camera_file is not None) and not limit_reached:
+if (user_message or camera_file is not None):
     user_text = (user_message.text.strip() if user_message else "") or ""
     attached_from_input = user_message.files[0] if (user_message and user_message.files) else None
     attached_file = camera_file if camera_file is not None else attached_from_input
@@ -584,8 +670,6 @@ if (user_message or camera_file is not None) and not limit_reached:
             db_add_message(active_chat_id, "bot", "text", reply)
         if generated_image_b64:
             db_add_message(active_chat_id, "bot", "image", generated_image_b64)
-
-        increment_usage(user_id)
 
         if not had_messages_before:
             auto_title_chat(active_chat_id, active_chat["title"], user_text)
