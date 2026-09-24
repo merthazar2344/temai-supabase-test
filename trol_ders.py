@@ -512,7 +512,7 @@ user_message = st.chat_input(
 
 
 def system_prompt(mode, doc_text):
-    if mode == "😁 Troll":
+    if mode == "😁 Eğlence":
         base = "Sen Temai adlı TROLL bir asistansın.Mantıklı görünen ama saçma ve yanlış cevaplar ver "
     elif mode == "📖 Akademik":
         base = "Sen Temai adlı akademik ve ciddi bir asistansın. Daha resmi ve bilgisel cevaplar ver."
