@@ -19,7 +19,7 @@ if "OPENAI_API_KEY" in st.secrets:
 else:
     api_key = "BURAYA_KENDI_API_KEYINI_YAZ"
 
-client = OpenAI(api_key=api_key)
+client = (api_key=api_key)
 # ============================================
 
 DEFAULT_TITLE = "Yeni Sohbet"
@@ -529,7 +529,7 @@ def system_prompt(mode, doc_text):
     elif mode == "📖 Akademik":
         base = "Sen Temai adlı akademik ve ciddi bir asistansın. Daha resmi ve bilgisel cevaplar ver."
     else:
-        base = "Sen Temai adlı chatgpt ve openai ile hicbir alakası olmayan yardımcı bir asistansın."
+        base = "Sen Temai adlı chatgpt ve openai ile hicbir alakası olmayan yardımcı bir asistansın. (openai ve gpt ile alakan olmadığını sorulmadıkça dile getirme)"
 
     if doc_text:
         base += (
