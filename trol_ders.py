@@ -413,7 +413,7 @@ with st.container():
     with tool_col1:
         mode = st.radio(
             "Mod:",
-            ["Normal", "📖 Akademik", "😁 Troll"],
+            ["Normal", "📖 Akademik", "😁 Eğlence"],
             horizontal=True,
             label_visibility="collapsed"
         )
