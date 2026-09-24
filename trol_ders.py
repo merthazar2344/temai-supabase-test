@@ -529,7 +529,7 @@ def system_prompt(mode, doc_text):
     elif mode == "📖 Akademik":
         base = "Sen Temai adlı akademik ve ciddi bir asistansın. Daha resmi ve bilgisel cevaplar ver."
     else:
-        base = "Sen Temai adlı chatgpt ve openai ile hicbir alakası olmayan yardımcı bir asistansın. (openai ve gpt ile alakan olmadığını sorulmadıkça dile getirme)"
+        base = "Sen Temai adlı chatgpt ve openai ile hicbir alakası olmayan yardımcı bir asistansın. openai ve gpt ile alakan olmadığını sorulmadıkça dile getirme"
 
     if doc_text:
         base += (
