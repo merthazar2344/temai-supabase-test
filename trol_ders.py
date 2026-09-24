@@ -19,7 +19,7 @@ if "OPENAI_API_KEY" in st.secrets:
 else:
     api_key = "BURAYA_KENDI_API_KEYINI_YAZ"
 
-client = (api_key=api_key)
+client = OpenAI(api_key=api_key)
 # ============================================
 
 DEFAULT_TITLE = "Yeni Sohbet"
@@ -126,8 +126,6 @@ h1 {
 """, unsafe_allow_html=True)
 
 # ================== "BENİ AÇIK TUT" - TARAYICI COOKIE'Sİ ==================
-# Streamlit her sayfa yenilemesinde session_state'i sıfırlayabilir; kalıcı giriş
-# için refresh_token'ı tarayıcı cookie'sinde saklıyoruz.
 from streamlit_cookies_manager import EncryptedCookieManager
 
 cookies = EncryptedCookieManager(
@@ -137,7 +135,6 @@ cookies = EncryptedCookieManager(
 if not cookies.ready():
     st.stop()
 
-# 1) Bu oturumda (session_state) zaten giriş bilgisi varsa, supabase client'a bağla.
 if st.session_state.get("access_token"):
     try:
         supabase.auth.set_session(
@@ -148,15 +145,13 @@ if st.session_state.get("access_token"):
         st.session_state.access_token = None
         st.session_state.refresh_token = None
 
-# 2) session_state boşsa (sayfa yenilendi/tarayıcı kapatılıp açıldı), "beni açık tut"
-#    ile bırakılmış cookie var mı diye bak, varsa oturumu ondan geri yükle.
 elif cookies.get("refresh_token"):
     try:
         res = supabase.auth.refresh_session(cookies.get("refresh_token"))
         st.session_state.user = res.user
         st.session_state.access_token = res.session.access_token
         st.session_state.refresh_token = res.session.refresh_token
-        cookies["refresh_token"] = res.session.refresh_token  # Supabase yeni bir refresh_token verebilir
+        cookies["refresh_token"] = res.session.refresh_token
         cookies.save()
     except Exception:
         pass
@@ -233,8 +228,6 @@ if not st.session_state.user:
                 try:
                     res = supabase.auth.sign_up({"email": signup_email, "password": signup_pw})
                     if res.session:
-                        # E-posta onayı kapalıysa Supabase burada direkt oturum döndürür,
-                        # kullanıcı mail beklemeden içeri girer.
                         st.session_state.user = res.user
                         st.session_state.access_token = res.session.access_token
                         st.session_state.refresh_token = res.session.refresh_token
@@ -248,7 +241,7 @@ if not st.session_state.user:
                 except Exception as e:
                     st.error(f"Kayıt başarısız: {e}")
 
-    st.stop()  # Giriş yapılmadan uygulamanın geri kalanı hiç çalışmasın.
+    st.stop()
 
 user = st.session_state.user
 user_id = user.id
@@ -273,7 +266,6 @@ st.sidebar.caption(f"👤 {display_name}")
 with st.sidebar.expander("⚙️ Profil / Hesap Ayarları"):
     st.caption(f"E-posta: {user.email}")
 
-    # --- İsim değiştir ---
     new_display_name = st.text_input("Görünen isim", value=display_name, key="profile_name")
     if st.button("İsmi Kaydet", key="save_name", use_container_width=True):
         db_update_profile(user_id, {"display_name": new_display_name.strip()})
@@ -282,7 +274,6 @@ with st.sidebar.expander("⚙️ Profil / Hesap Ayarları"):
 
     st.markdown("---")
 
-    # --- E-posta değiştir ---
     new_email = st.text_input("Yeni e-posta", key="profile_email")
     if st.button("E-postayı Değiştir", key="save_email", use_container_width=True):
         if not new_email.strip():
@@ -299,7 +290,6 @@ with st.sidebar.expander("⚙️ Profil / Hesap Ayarları"):
 
     st.markdown("---")
 
-    # --- Şifre değiştir ---
     new_pw = st.text_input(
         "Yeni şifre (en az 6 karakter, 1 harf + 1 rakam)",
         type="password", key="profile_pw"
@@ -320,7 +310,6 @@ with st.sidebar.expander("⚙️ Profil / Hesap Ayarları"):
 
     st.markdown("---")
 
-    # --- Hesap verilerini sil ---
     st.caption(
         "⚠️ Bu işlem tüm sohbetlerini ve mesajlarını kalıcı olarak siler. "
         "(Not: Bu, sadece Temai'deki verilerini siler; giriş hesabının tamamen "
@@ -363,7 +352,6 @@ if st.sidebar.button("➕ Yeni Sohbet Ekle", use_container_width=True):
     st.session_state.active_chat_id = new_chat["id"]
     st.rerun()
 
-# Aktif sohbet geçerli değilse (silinmiş, ilk açılış vs.) uygun bir tane seç/oluştur.
 if "active_chat_id" not in st.session_state or not any(c["id"] == st.session_state.active_chat_id for c in chats):
     if chats:
         st.session_state.active_chat_id = chats[0]["id"]
@@ -691,7 +679,6 @@ if (user_message or camera_file is not None):
                         "image_url": f"data:{image_mime};base64,{image_base64}"
                     })
 
-                # En güncel belge metnini veritabanından tazele (az önce yüklenmiş olabilir).
                 fresh_chat = supabase.table("chats").select("*").eq("id", active_chat_id).execute().data[0]
 
                 reply, resp_id, generated_image_b64 = ask_temai(
